@@ -21,7 +21,8 @@ jobs:
       - name: Test voice delivery in a temporary studio
         working-directory: crates/production-runtime/desktop
         run: |
-          cargo test --locked rune_studio::publish::tests::voice_
+          cargo test --locked voice_
+          cargo test --locked collapsed_top_and_bottom
           cargo test --locked quick_publish_shows_only_sign_in_and_resumes_after_authentication
       - name: Build native Dev executable
         working-directory: crates/production-runtime/desktop

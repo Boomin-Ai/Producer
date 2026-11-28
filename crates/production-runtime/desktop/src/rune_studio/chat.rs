@@ -200,6 +200,9 @@ impl Chat {
     pub(super) fn busy(&self) -> bool {
         self.turn.is_some() || self.applying.is_some() || self.requested_review
     }
+    pub(super) fn attach_voice_receipt(&mut self, row: usize, turn: Arc<Turn>) {
+        self.receipts.insert(row, turn);
+    }
     fn latest(&self) -> Option<&Turn> {
         self.receipts.values().next_back().map(Arc::as_ref)
     }
@@ -679,7 +682,7 @@ impl Chat {
                     let editor = editor.and_then(super::editor::Editor::assistant_review_state);
                     json!({"ok":true,"generation":self.generation,"busy":busy,"status":if self.progress.is_empty(){&self.status}else{&self.progress},"account":self.account.label(),"reviewReady":self.proposal.is_some(),"editor":editor,
                         "steps":self.latest().map(|t|t.receipt()),"logTurnId":self.latest().and_then(|t|t.journal.as_ref()).map(|j|&j.id),
-                        "modelCalls":self.latest().map(|t|t.calls.load(Ordering::Relaxed)),
+                        "voiceActive":self.voice.listening(),"voiceStatus":self.voice.status,"modelCalls":self.latest().map(|t|t.calls.load(Ordering::Relaxed)),
                         "reply":self.history.last().filter(|(role,_)|role=="assistant").map(|(_,msg)|msg)})
                 }
                 AssistantReview { generation }

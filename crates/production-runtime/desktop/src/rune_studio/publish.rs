@@ -1910,14 +1910,14 @@ mod tests {
         assert!(draft.review(&studio, "").is_err());
         assert!(VoiceDraft::prepare(&studio, "Hello", "first", true).is_err());
         draft.review(&studio, "@second").unwrap();
-        queue_voice(&studio,&draft).unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        queue_voice(&studio,&draft, None).unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         let queued = outbox::list(&outbox_dir(&studio)).unwrap();
         assert_eq!(queued.len(),1);
         assert_eq!(queued[0].targets[0].id,"two");
         assert_eq!(queued[0].text,"Hello");
         assert_eq!(studio.publish.caption.text,"Unrelated typed draft");
         studio.publish.scope = None;
-        assert!(queue_voice(&studio,&draft).is_err());
+        assert!(queue_voice(&studio,&draft, None).is_err());
     }
 
     #[test]
@@ -1966,6 +1966,36 @@ mod tests {
         assert!(voice::run(&mut rt.state, "publish_draft",
             &json!({"revision":old_revision}), "queue").is_err());
         assert!(outbox::list(&outbox_dir(&rt.state)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn voice_schedule_validates_local_time_and_only_stages_the_reviewed_revision() {
+        use super::super::voice;
+        let scratch = tempfile::tempdir().unwrap();
+        let mut s = Studio::new(scratch.path().into());
+        s.publish.scope = Some(("brand".into(), "operator".into()));
+        s.publish.channels = serde_json::from_value(json!([
+            {"id":"channel","platform":"threads","status":"active","external_handle":"operator"}
+        ])).unwrap();
+        let draft = voice::run(&mut s, "draft_threads", &json!({"text":"Tomorrow's post"}), "draft").unwrap().unwrap();
+        let revision = draft.split_whitespace().nth(1).unwrap();
+        let schedule = |s: &mut Studio, time| {
+            voice::run(s, "schedule_draft", &json!({"revision":revision,"local_time":time}), "schedule").unwrap();
+            let start = Instant::now();
+            while !voice::poll(s) {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        schedule(&mut s, "2020-01-01 12:00");
+        assert!(s.chat.voice.status.contains("future"));
+        assert!(outbox::list(&outbox_dir(&s)).unwrap().is_empty());
+        schedule(&mut s, "2099-12-01 11:00");
+        let posts = outbox::list(&outbox_dir(&s)).unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].schedule.as_deref(), Some(schedule_utc("2099-12-01 11:00").unwrap().as_str()));
+        assert!(s.chat.voice.status.contains("Queued for scheduled delivery"));
+        assert!(voice::run(&mut s, "publish_draft", &json!({"revision":revision}), "again").is_err());
     }
 
     #[test]
@@ -2570,7 +2600,7 @@ pub(super) fn has_threads(s: &Studio) -> bool {
     s.publish.scope.is_some() && s.publish.channels.iter().any(|c| c.platform == "threads" && c.status == "active")
 }
 
-pub(super) fn queue_voice(s: &Studio, draft: &VoiceDraft) -> Result<mpsc::Receiver<Result<()>>> {
+pub(super) fn queue_voice(s: &Studio, draft: &VoiceDraft, local_time: Option<String>) -> Result<mpsc::Receiver<Result<()>>> {
     let dest = draft.destination.as_ref().context("Review the saved draft and destination before publishing")?;
     ensure!(s.publish.scope.as_ref() == Some(&dest.scope),"Boomin account changed. Review the draft again");
     ensure!(s.publish.channels.iter().any(|c| c.id == dest.channel && c.platform == "threads" && c.status == "active"),"Reconnect the Threads account and review the draft");
@@ -2582,6 +2612,13 @@ pub(super) fn queue_voice(s: &Studio, draft: &VoiceDraft) -> Result<mpsc::Receiv
         targets:vec![outbox::Destination{id:dest.channel.clone(),label:dest.label.clone(),key:draft.revision.clone(),overrides:options,format:None,cover:None}]
     };
     let (tx,rx) = mpsc::channel();
-    std::thread::spawn(move || {let _ = tx.send(post.stage(&root).map(|_|()));});
+    std::thread::spawn(move || {
+        let mut post = post;
+        let result = (|| {
+            post.schedule = local_time.as_deref().map(schedule_utc).transpose()?;
+            post.stage(&root).map(|_| ())
+        })();
+        let _ = tx.send(result);
+    });
     Ok(rx)
 }

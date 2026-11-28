@@ -119,7 +119,16 @@
                 }
             } else if ([type isEqual:@"error"] || [type isEqual:@"session.closed"]) {
                 [self fail:event[@"error"][@"message"] ?: @"Voice session ended"];
-            } else if ([type isEqual:@"response.event"] || [type hasSuffix:@"transcript.delta"]) {
+            } else if ([type isEqual:@"response.event"]) {
+                // The room consumes tool calls and lifecycle events. Streaming the delegated
+                // model's token deltas through the UI queue adds work during audio playback.
+                NSDictionary *nested = event[@"event"];
+                NSString *kind = nested[@"type"];
+                if ([kind isEqual:@"response.created"] || [kind isEqual:@"response.failed"] ||
+                    ([kind isEqual:@"response.output_item.done"] && [nested[@"item"][@"type"] isEqual:@"function_call"])) {
+                    [self emit:event];
+                }
+            } else if ([type hasSuffix:@"transcript.delta"]) {
                 [self emit:event];
             }
             if (!self.stopped) [self receive];
