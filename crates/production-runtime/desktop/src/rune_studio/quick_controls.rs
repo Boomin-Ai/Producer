@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub(super) struct QuickControls {
     expanded: Option<QuickControl>,
     editing: bool,
+    adding: bool,
     headline: Option<HeadlineDraft>,
     section_draft: Option<SectionDraft>,
     move_shortcut: Option<QuickControl>,
@@ -184,7 +185,7 @@ fn key(control: &QuickControl) -> String {
 fn label(control: &QuickControl) -> &str {
     match control {
         QuickControl::Camera => "Camera",
-        QuickControl::Microphone => "Mic",
+        QuickControl::Microphone => "Mic · Talk to Duce",
         QuickControl::ScreenShare => "Screen Share",
         QuickControl::Layouts => "Layouts",
         QuickControl::Headline => "Headline",
@@ -296,7 +297,7 @@ fn disclosure(expanded: bool) -> El {
 }
 
 fn with_settings(action: El, control: QuickControl, expanded: bool) -> El {
-    let name = label(&control);
+    let name = if control == QuickControl::Microphone { "mic" } else { label(&control) };
     let settings = panels::tool(
         &format!("quick-{}-settings", key(&control)),
         if expanded { "chevron-up" } else { "chevron-down" },
@@ -772,6 +773,7 @@ fn pick_sound(live: &Live, workspace: &Workspace, picker: &SoundPicker) -> El {
             move |s| {
                 send_workspace(s, WorkspaceCommand::PinControl { control: control.clone() });
                 s.quick_controls.sound_picker = None;
+                s.quick_controls.adding = false;
             },
         ).label(format!("Add {}", sound.name)).help(&sound.name).disabled(pinned));
     }
@@ -917,21 +919,54 @@ pub(super) fn rail_editor(s: &Studio, width: f32, height: f32) -> Option<El> {
         .child(button("shortcut-rail-close", "Close", false, |s| s.quick_controls.collapse()).self_start()))
 }
 
+fn open_sound_picker(s: &mut Studio) {
+    s.quick_controls.sound_picker = Some(SoundPicker::default());
+    s.quick_controls.section_draft = None;
+    s.quick_controls.move_shortcut = None;
+}
+
+fn shortcut_picker(workspace: &Workspace) -> El {
+    let mut choices = col().gap(4.);
+    for control in QuickControl::BUILT_INS {
+        let pinned = workspace.shortcuts().any(|pin| pin == &control);
+        let name = label(&control);
+        let caption = if pinned { format!("{name} · Added") } else { name.to_owned() };
+        choices = choices.child(button(format!("quick-pin-{}", key(&control)), caption, false, move |s| {
+            send_workspace(s, WorkspaceCommand::PinControl { control: control.clone() });
+            s.quick_controls.adding = false;
+        }).disabled(pinned));
+    }
+    choices.child(button("quick-add-sound", "+ Sound", false, open_sound_picker))
+}
+
 pub(super) fn panel(s: &Studio, width: f32) -> El {
     let live = s.live.as_ref().unwrap();
     let workspace = &live.snapshot.project.workspace;
     let mut list = col().key("quick-controls-body").min_w(0.).gap(6.);
+    if s.quick_controls.editing && workspace.panels[&PanelId::QuickControls].header == HeaderMode::Hidden {
+        list = list.child(column_picker(s));
+    }
+    let mut tools = row().gap(4.).flex_wrap().child(button(
+        "quick-add-shortcut", if s.quick_controls.adding { "Close picker" } else { "+ Add shortcut" },
+        false, |s| {
+            let quick = &mut s.quick_controls;
+            quick.adding = !quick.adding;
+            quick.sound_picker = None;
+        },
+    ));
+    if s.quick_controls.adding {
+        return list.child(tools).child(match &s.quick_controls.sound_picker {
+            Some(picker) => pick_sound(live, workspace, picker),
+            None => shortcut_picker(workspace),
+        });
+    }
     if s.quick_controls.editing {
-        if workspace.panels[&PanelId::QuickControls].header == HeaderMode::Hidden {
-            list = list.child(column_picker(s));
-        }
-        list = list.child(row().gap(4.).flex_wrap()
+        tools = tools
             .child(button("quick-add-section", "+ Section", false, |s| start_section(s, None, "")))
-            .child(button("quick-add-sound", "+ Sound", false, |s| {
-                s.quick_controls.sound_picker = Some(SoundPicker::default());
-                s.quick_controls.section_draft = None;
-                s.quick_controls.move_shortcut = None;
-            })));
+            .child(button("quick-add-sound", "+ Sound", false, open_sound_picker));
+    }
+    list = list.child(tools);
+    if s.quick_controls.editing {
         if let Some(draft) = &s.quick_controls.section_draft {
             list = list.child(section_form(draft, workspace));
         }
@@ -949,14 +984,6 @@ pub(super) fn panel(s: &Studio, width: f32) -> El {
                     edit_shortcuts(s, live, workspace, &section.controls, Some(section.id))
                 }));
         }
-        let mut picker = row().flex_wrap().gap(4.);
-        for control in QuickControl::BUILT_INS.into_iter().filter(|control| !workspace.shortcuts().any(|pin| pin == control)) {
-            picker = picker.child(workspace_button(
-                format!("quick-pin-{}", key(&control)), label(&control).to_owned(),
-                WorkspaceCommand::PinControl { control },
-            ));
-        }
-        list = list.child(picker);
     } else {
         let columns = if workspace.shortcut_columns == ShortcutColumns::Two && width >= 220. { 2 } else { 1 };
         list = list.child(shortcut_tiles(s, live, &workspace.quick_controls, columns));
@@ -982,6 +1009,53 @@ pub(super) fn panel(s: &Studio, width: f32) -> El {
 #[cfg(test)]
 mod rail_tests {
     use super::*;
+
+    #[test]
+    fn add_shortcut_is_available_in_panel_and_edit_mode() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (handle, commands, _plan) = engine::initial_room(scratch.path()).unwrap();
+        let mut snapshot = handle.snapshot();
+        let ws = &mut snapshot.project.workspace;
+        ws.apply(WorkspaceCommand::AddShortcutSection { name: "Audio".into() }).unwrap();
+        let section = ws.shortcut_sections.last().unwrap().id;
+        ws.apply(WorkspaceCommand::MoveControlToSection { control: QuickControl::Microphone, section: Some(section) }).unwrap();
+        let mut s = Studio::new(scratch.path().into());
+        s.live = Some(Live { handle, snapshot, performance:StudioPerformance::new(0),
+            clip_view:Some(Default::default()), broadcast_view:Default::default(),
+            surfaces:std::array::from_fn(|_| NativeSurface::new()), guest_thumbnail:NativeSurface::new(),
+            worker:None, reviewing:Default::default(), previewing:Default::default(),
+            guest_view:Default::default(), updated:Instant::now() });
+        let mut rt = rune::Runtime::new(s, |s, _| panel(s, 400.), (400., 800.), rune::Env::default());
+        rt.frame(0.);
+        let click = |rt: &mut rune::Runtime<Studio>, key: &str| {
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.04);
+        };
+        click(&mut rt, "quick-add-shortcut");
+        for control in QuickControl::BUILT_INS {
+            click(&mut rt, &format!("quick-pin-{}", key(&control)));
+        }
+        assert!(commands.try_recv().is_err(), "Already pinned shortcuts must be disabled");
+        click(&mut rt, "quick-add-sound");
+        assert!(rt.find("quick-sound-search").is_some());
+        click(&mut rt, "quick-add-shortcut");
+        click(&mut rt, "quick-edit-pins");
+        click(&mut rt, "quick-remove-mic");
+        let apply = |rt: &mut rune::Runtime<Studio>| {
+            let RoomCommand::Workspace { command } = commands.try_recv().unwrap().command else { panic!("expected workspace change") };
+            rt.state.live.as_mut().unwrap().snapshot.project.workspace.apply(command).unwrap();
+            rt.frame(0.05);
+        };
+        apply(&mut rt);
+        click(&mut rt, "quick-add-shortcut");
+        click(&mut rt, "quick-pin-mic");
+        apply(&mut rt);
+        assert!(rt.state.quick_controls.editing && !rt.state.quick_controls.adding);
+        let ws = &rt.state.live.as_ref().unwrap().snapshot.project.workspace;
+        assert_eq!(ws.shortcuts().filter(|p| **p == QuickControl::Microphone).count(), 1);
+    }
 
     #[test]
     fn collapsed_top_and_bottom_route_shortcuts_and_editors() {
