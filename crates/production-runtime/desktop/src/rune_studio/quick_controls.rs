@@ -253,61 +253,42 @@ fn source_name(snap: &Snapshot, source: &str) -> String {
         .into()
 }
 
-fn camera_or_mic(snap: &Snapshot, control: &QuickControl, compact: bool, expanded: bool) -> El {
-    let is_mic = *control == QuickControl::Microphone;
-    let source = if is_mic { "microphone" } else { "camera" };
-    let lane = snap.project.lanes.iter().find(|lane| lane.source == source);
-    let key = format!("quick-{}", key(control));
-    let mut r = control_row(
-        &key,
-        label(control),
-        icon(control),
-        expanded,
-        compact,
-        None,
-    );
-    let device = source_name(snap, source);
+fn camera(snap: &Snapshot, compact: bool, expanded: bool) -> El {
+    let device = source_name(snap, "camera");
+    let mut tile = control_row("quick-camera", "Camera", "camera", expanded, compact, None);
     if compact {
-        r = r.help(device);
-    } else if !compact {
-        r = r.child(title(device, 10., 500., MUTED).max_w(124.));
+        tile = tile.help(device);
+    } else {
+        tile = tile.child(title(device, 10., 500., MUTED).max_w(124.));
     }
-    let control = control.clone();
-    r = r
-        .child(disclosure(expanded))
-        .on_press(move |s: &mut Studio| toggle(s, &control));
-    if is_mic {
-        if let Some(lane) = lane {
-            let peak = snap.mixer_peaks.get(source).copied().unwrap_or(0.);
-            let level = mixer::meter_level(peak * lane.gain, lane.muted);
-            r = row()
-                .items_center()
-                .gap(4.)
-                .child(r.w(0.).grow(1.))
-                .child(
-                    el().w(if compact { 13. } else { 19. })
-                        .h(4.)
-                        .radius(2.)
-                        .fill(color(theme::SLIDER_RAIL_COMPACT))
-                        .child(el().w_frac(level).h_full().radius(2.).fill(color(MINT))),
-                )
-                .child(
-                    panels::send_tool(
-                        "quick-mic-mute",
-                        if lane.muted { "mic-off" } else { "mic" },
-                        if lane.muted { "Unmute mic" } else { "Mute mic" },
-                        lane.muted,
-                        RoomCommand::Gain {
-                            source: source.into(),
-                            gain: lane.gain,
-                            muted: !lane.muted,
-                        },
-                    )
-                    .size(if compact { 23. } else { 29. }, 30.),
-                );
-        }
+    tile.child(disclosure(expanded))
+        .on_press(|s: &mut Studio| toggle(s, &QuickControl::Camera))
+}
+
+fn mic(s: &Studio, snap: &Snapshot, compact: bool, expanded: bool) -> El {
+    let voice = &s.chat.voice;
+    let on = voice.listening();
+    let label = if on {
+        if voice.mic_ready { "Listening" } else { "Connecting…" }
+    } else if compact { "Duce" } else { "Talk to Duce" };
+    let help = if on { "End Duce voice session" } else { "Talk to Duce" };
+    let talk = control_row("quick-mic", label, if on { "stop" } else { "mic" }, on, compact, None)
+        .label(help).help(help).on_press(super::voice::toggle);
+    let mut tile = row().items_center().gap(3.)
+        .child(with_settings(talk, QuickControl::Microphone, expanded).w(0.).grow(1.));
+    if let Some(lane) = snap.project.lanes.iter().find(|lane| lane.source == "microphone") {
+        let peak = snap.mixer_peaks.get("microphone").copied().unwrap_or(0.);
+        let level = mixer::meter_level(peak * lane.gain, lane.muted);
+        tile = tile.child(el().w(if compact { 10. } else { 19. }).h(4.).radius(2.)
+                .fill(color(theme::SLIDER_RAIL_COMPACT))
+                .child(el().w_frac(level).h_full().radius(2.).fill(color(MINT))))
+            .child(panels::send_tool("quick-mic-mute",
+                if lane.muted { "mic-off" } else { "mic" },
+                if lane.muted { "Unmute program mic" } else { "Mute program mic" }, lane.muted,
+                RoomCommand::Gain { source: "microphone".into(), gain: lane.gain, muted: !lane.muted },
+            ).size(if compact { 23. } else { 29. }, 30.));
     }
-    r
+    tile
 }
 
 fn disclosure(expanded: bool) -> El {
@@ -569,9 +550,8 @@ fn action(s: &Studio, live: &Live, control: &QuickControl, compact: bool) -> El 
     let key = format!("quick-{}", key(control));
     let expanded = s.quick_controls.expanded.as_ref() == Some(control);
     match control {
-        QuickControl::Camera | QuickControl::Microphone => {
-            return camera_or_mic(snap, control, compact, expanded)
-        }
+        QuickControl::Camera => return camera(snap, compact, expanded),
+        QuickControl::Microphone => return mic(s, snap, compact, expanded),
         QuickControl::ScreenShare => {
             let sharing = panels::slot_ready(snap, "screen");
             let status = if sharing { "Sharing" } else { "Off" };
@@ -900,7 +880,8 @@ pub(super) fn rail(s: &Studio, live: &Live) -> El {
         }
         for control in controls {
             let width = match control {
-                QuickControl::Microphone | QuickControl::Sound(_) => 128.,
+                QuickControl::Microphone => 158.,
+                QuickControl::Sound(_) => 128.,
                 QuickControl::ScreenShare | QuickControl::SaveClip => 115.,
                 _ => 96.,
             };
@@ -922,7 +903,7 @@ pub(super) fn rail_editor(s: &Studio, width: f32, height: f32) -> Option<El> {
         return None;
     }
     let anchor = match control {
-        QuickControl::SaveClip | QuickControl::Publish => format!("quick-{}-settings", key(control)),
+        QuickControl::Microphone | QuickControl::SaveClip | QuickControl::Publish => format!("quick-{}-settings", key(control)),
         _ => format!("quick-{}", key(control)),
     };
     let width = (width - 16.).clamp(1., 370.);
@@ -1049,7 +1030,13 @@ mod rail_tests {
             for id in [section,empty] {
                 assert!(rt.find(&format!("quick-section-{id}")).is_some());
             }
-            for id in ["quick-camera","quick-mic","quick-screen","quick-layouts","quick-clip-settings","quick-publish-settings"] {
+            click(&mut rt, "quick-mic");
+            assert!(rt.state.chat.voice.listening());
+            assert!(!rt.state.show_chat && rt.find("shortcut-rail-editor").is_none());
+            click(&mut rt, "quick-mic");
+            assert!(!rt.state.chat.voice.listening());
+            assert!(commands.try_recv().is_err(), "Duce must not send a program audio command");
+            for id in ["quick-camera","quick-mic-settings","quick-screen","quick-layouts","quick-clip-settings","quick-publish-settings"] {
                 click(&mut rt,id);
                 assert!(rt.find("shortcut-rail-editor").is_some(), "{id} on {edge:?}");
                 click(&mut rt,"shortcut-rail-close");
