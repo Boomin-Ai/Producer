@@ -281,6 +281,7 @@ pub struct Snapshot {
     pub frame_age_ms: [f64; 3],
     pub source_frames: [u64; 3],
     pub output_frames: [u64; 2],
+    pub video_draw_slot_masks: [u32; 2],
     pub microphone_peak: f32,
     pub mixer_peaks: std::collections::BTreeMap<String, f32>,
     pub audio_frames: u64,
@@ -692,6 +693,7 @@ struct RenderStats {
     movie_playback: VideoDiagnostics,
     source_frames: [u64; 3],
     output_frames: [u64; 2],
+    video_draw_slot_masks: [u32; 2],
     frame_age_ms: [f64; 3],
     microphone_peak: f32,
     mixer_peaks: std::collections::BTreeMap<String, f32>,
@@ -727,6 +729,7 @@ impl RenderStats {
         s.cpu_p99_ms = self.cpu_p99_ms;
         s.movie_playback = self.movie_playback.clone();
         s.source_frames = self.source_frames;
+        s.video_draw_slot_masks = self.video_draw_slot_masks;
         s.output_frames = self.output_frames;
         s.frame_age_ms = self.frame_age_ms;
         s.microphone_peak = self.microphone_peak;
@@ -1043,6 +1046,7 @@ pub(crate) fn initial_room(root: &Path) -> Result<(Arc<Handle>,Receiver<Envelope
         frame_age_ms: [-1.; 3],
         source_frames: [0; 3],
         output_frames: [0; 2],
+        video_draw_slot_masks: [0; 2],
         microphone_peak: 0.,
         mixer_peaks: Default::default(),
         audio_frames: 0,
@@ -1079,13 +1083,13 @@ pub(crate) fn initial_room(root: &Path) -> Result<(Arc<Handle>,Receiver<Envelope
     });
     Ok((handle,rx,plan))
 }
-pub fn start(root: PathBuf) -> Result<Arc<Handle>> {
+pub fn start(root: PathBuf, restore_program_cameras: bool) -> Result<Arc<Handle>> {
     let (handle,rx,plan)=initial_room(&root)?;
     let shared = handle.clone();
     std::thread::Builder::new()
         .name("producer-room-control".into())
         .spawn(move || {
-            if let Err(e) = control(root, shared.clone(), rx, plan) {
+            if let Err(e) = control(root, shared.clone(), rx, plan, restore_program_cameras) {
                 shared.snapshot.lock().unwrap().error = Some(format!("Native runtime: {e:#}"));
                 shared.closed.store(true, Ordering::Release);
             }
@@ -1922,11 +1926,31 @@ fn commit_set_edit(
     Ok(())
 }
 
+// A saved binding names a device. The program renderer still needs a capture
+// session when the room reopens or a newly selected layout first uses it.
+fn program_camera_bindings(project: &RoomProject, pair: &SetLayoutPair) -> std::collections::BTreeMap<String, String> {
+    let mut cameras = std::collections::BTreeMap::new();
+    let Some(set) = project.mounted_set.as_ref().and_then(|id| project.production.sets.get(id)) else {
+        return cameras;
+    };
+    for slot in crate::set_slots::for_pair(project, set, pair) {
+        let source = slot.source;
+        if !project.lanes.iter().any(|lane| lane.source == source) { continue; }
+        if let Some(binding) = project.inputs.get(&source).filter(|binding| binding.kind == "camera") {
+            cameras.insert(source, binding.device.clone());
+        } else if source == "camera" {
+            cameras.insert(source, String::new());
+        }
+    }
+    cameras
+}
+
 fn control(
     root: PathBuf,
     handle: Arc<Handle>,
     rx: Receiver<Envelope>,
     _plan: Arc<Plan>,
+    restore_program_cameras: bool,
 ) -> Result<()> {
     let mut state = handle.snapshot();
     let (tx, render_rx) = mpsc::sync_channel(16);
@@ -1988,6 +2012,10 @@ fn control(
         state.show_elapsed = show.as_secs_f64();
         state.segment_elapsed = segment.as_secs_f64();
     };
+    let mut primary_camera_stopped = false;
+    let mut camera_revision = None;
+    let mut camera_layout = None;
+    let mut requested_cameras = std::collections::BTreeMap::new();
     let mut broadcast_poll=Instant::now();
     while !handle.closed.load(Ordering::Acquire) {
         if broadcast_poll.elapsed()>=Duration::from_millis(250){broadcast_poll=Instant::now();let media=handle.media.lock().unwrap().clone();if let Some(m)=media{m.broadcast.poll();}}
@@ -2011,6 +2039,29 @@ fn control(
             if let Some(p)=peer.as_ref(){let _=p.tally(false);}
         }
         let live=handle.program.lock().unwrap().clone();
+        if restore_program_cameras && (camera_revision != Some(state.program_revision) || camera_layout != state.program_layout) {
+            camera_revision = Some(state.program_revision);
+            camera_layout.clone_from(&state.program_layout);
+            let mut needed = if matches!(state.program_kind.as_str(), "set" | "show") {
+                let pair = camera_layout.clone().unwrap_or_else(|| live.output_layout_pair());
+                program_camera_bindings(&live, &pair)
+            } else { Default::default() };
+            needed.retain(|source, device| {
+                if source == "camera" && primary_camera_stopped { return false; }
+                if requested_cameras.get(source) == Some(device) { return true; }
+                let start = if source == "camera" {
+                    RenderOp::Capture(true, false, false)
+                } else {
+                    RenderOp::StartBoundCamera { source: source.clone(), device: device.clone() }
+                };
+                if let Err(error) = render.request(start) {
+                    state.error = Some(format!("Could not start camera {source}: {error}"));
+                    return false;
+                }
+                true
+            });
+            requested_cameras = needed;
+        }
         history.observe(&observed,rtc_staged,&live,state.program_revision)?;
         // A completed sequence belongs to one specific program revision. An old
         // frame must never advance a segment that the operator has already cut.
@@ -2046,6 +2097,13 @@ fn control(
             warmed_set = Some(live.scene.clone());
         }
         if let Ok(envelope) = incoming {
+            match &envelope.command {
+                RoomCommand::StopCamera => primary_camera_stopped = true,
+                RoomCommand::Capture { camera: true, .. } => primary_camera_stopped = false,
+                RoomCommand::SetBindSource { source, .. } | RoomCommand::ConfigureInput { source, .. }
+                    if source == "camera" => primary_camera_stopped = false,
+                _ => {}
+            }
             if let RoomCommand::StageHistory{participant,before}=&envelope.command {
                 let reply=history.list(participant.as_deref(),before.as_deref()).unwrap_or_else(|e|serde_json::json!({"ok":false,"error":e.to_string()}));
                 if let Some(tx)=envelope.reply{let _=tx.try_send(reply);}continue;
@@ -3668,6 +3726,11 @@ fn render_loop(
             for (source, peak) in ["movie", "take"].into_iter().zip(&mut movie_peaks) {
                 state.mixer_peaks.insert(source.into(), std::mem::take(peak));
             }
+            // Sample the video draws actually included in each composition at
+            // diagnostics cadence. A live input counter alone cannot show this.
+            state.video_draw_slot_masks = std::array::from_fn(|i| draws[i].iter()
+                .filter(|draw| draw.kind == 1 && draw.source < 8)
+                .fold(0, |mask, draw| mask | (1 << draw.source)));
             state.input_status.clear();
             for (source, input) in &inputs {
                 let mic = project
@@ -3781,6 +3844,39 @@ mod playback_tests {
     use super::*;
 
     #[test]
+    fn restored_set_camera_demand_matches_both_program_layouts() -> Result<()> {
+        use std::collections::BTreeMap;
+        let mut room = RoomProject::demo();
+        let mut set = crate::studio_presets::classic()?.set;
+        let pair = SetLayoutPair { landscape: "landscape".into(), vertical: "vertical".into() };
+        let host = "camera";
+        let second = "camera-2";
+        // Saved portrait and landscape layouts can bind different studio inputs.
+        fn replace(node: &mut producer_production_contract::Node, from: &str, to: &str) {
+            if let producer_production_contract::Content::Source { source, .. } = &mut node.content {
+                if source == from { *source = to.into(); }
+            }
+            for child in &mut node.children { replace(child, from, to); }
+        }
+        replace(&mut set.layouts.get_mut("vertical").unwrap().root, host, second);
+        room.production.sets.insert("classic".into(), set);
+        room.mount_set(Some("classic".into()), Some(pair.clone()))?;
+        let mut lane = room.lanes.iter().find(|l| l.source == host).unwrap().clone();
+        lane.source = second.into();
+        room.lanes.push(lane);
+        room.inputs.insert(second.into(), model::InputBinding { kind:"camera".into(), device:"external".into(), slot:4 });
+        let expected = BTreeMap::from([(host.into(), String::new()), (second.into(), "external".into())]);
+        assert_eq!(program_camera_bindings(&room, &pair), expected);
+        let opening = SetLayoutPair { landscape:"opening-landscape".into(), vertical:"opening-vertical".into() };
+        assert!(program_camera_bindings(&room, &opening).is_empty());
+        room.lanes.retain(|l| l.source != second);
+        assert_eq!(program_camera_bindings(&room, &pair).len(), 1);
+        room.mount_set(None, None)?;
+        assert!(program_camera_bindings(&room, &pair).is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn authored_take_confirms_both_native_outputs_and_recovers_from_a_missing_orientation() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut room = RoomProject::demo();
@@ -3793,7 +3889,7 @@ mod playback_tests {
         crate::authored_set::prepare(&room, design)?.install(&mut room)?;
         let pair = |name: &str| SetLayoutPair {landscape:format!("{name}-landscape"),vertical:format!("{name}-vertical")};
         persist(root.path(), &room)?;
-        let handle = start(root.path().to_path_buf())?;
+        let handle = start(root.path().to_path_buf(), false)?;
         struct Worker(Arc<Handle>);
         impl Drop for Worker {
             fn drop(&mut self) {

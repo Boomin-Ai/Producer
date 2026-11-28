@@ -174,7 +174,7 @@ impl Live {
     fn start(path: PathBuf, pending: Option<String>, capture: bool) -> anyhow::Result<Self> {
         let listener = crate::ipc::reserve(&path)?;
         crate::starter_sets::install(&path)?;
-        let handle = engine::start(path.clone())?;
+        let handle = engine::start(path.clone(), capture && pending.is_none())?;
         if let Err(e) = crate::ipc::serve(listener, handle.clone()) {
             handle.closed.store(true, Ordering::Release);
             return Err(e);
@@ -183,7 +183,7 @@ impl Live {
         let snap = handle.snapshot();
         if pending.is_some() {
             *handle.pending_rtc_link.lock().unwrap() = pending;
-        } else if capture {
+        } else if capture && std::env::var_os("PRODUCER_PROGRAM_CAMERAS_ONLY").is_none() {
             let has = |name| snap.project.lanes.iter().any(|l| l.source == name);
             if let Err(e) = handle.send(RoomCommand::Capture {
                 camera: has("camera"),
