@@ -61,15 +61,18 @@ fn channel(snapshot: &Snapshot, lane: &Lane, compact: bool) -> El {
     }
 }
 
-pub(super) fn shortcut_mic_gain(snapshot: &Snapshot) -> Option<El> {
+pub(super) fn shortcut_mic_controls(snapshot: &Snapshot) -> Option<El> {
     let lane = snapshot.project.lanes.iter().find(|lane| lane.source == "microphone")?;
     let peak = snapshot.mixer_peaks.get(&lane.source).copied().unwrap_or(0.);
     let level = meter_level(peak * lane.gain, lane.muted);
     let db = gain_readout(lane.gain);
-    Some(row().items_center().gap(4.).flex_wrap()
-        .child(title("Mic gain", 11., 500., MUTED))
+    let mute = command("quick-mic-mute", if lane.muted { "Unmute program mic" } else { "Mute program mic" },
+        lane.muted, RoomCommand::Gain { source: lane.source.clone(), gain: lane.gain, muted: !lane.muted });
+    let gain = row().items_center().gap(4.).flex_wrap()
+        .child(title("Program mic gain", 11., 500., MUTED))
         .child(fader(lane, level, &db, true, "quick-"))
-        .child(title(db, 11., 500., MUTED)))
+        .child(title(db, 11., 500., MUTED));
+    Some(col().gap(4.).child(gain).child(mute.self_start()))
 }
 
 fn gain_readout(gain: f32) -> String {

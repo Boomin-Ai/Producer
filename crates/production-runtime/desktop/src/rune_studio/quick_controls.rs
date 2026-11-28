@@ -266,30 +266,26 @@ fn camera(snap: &Snapshot, compact: bool, expanded: bool) -> El {
         .on_press(|s: &mut Studio| toggle(s, &QuickControl::Camera))
 }
 
-fn mic(s: &Studio, snap: &Snapshot, compact: bool, expanded: bool) -> El {
+fn mic(s: &Studio, compact: bool, expanded: bool) -> El {
     let voice = &s.chat.voice;
     let on = voice.listening();
     let label = if on {
         if voice.mic_ready { "Listening" } else { "Connecting…" }
     } else if compact { "Duce" } else { "Talk to Duce" };
     let help = if on { "End Duce voice session" } else { "Talk to Duce" };
-    let talk = control_row("quick-mic", label, if on { "stop" } else { "mic" }, on, compact, None)
+    let surface = if on { theme::TOOL_SELECTED } else { SURFACE };
+    let talk = control_row("quick-mic", label, if on { "stop" } else { "mic" }, false, compact, None)
+        .w(0.).grow(1.).radius(0.).fill(color(surface))
         .label(help).help(help).on_press(super::voice::toggle);
-    let mut tile = row().items_center().gap(3.)
-        .child(with_settings(talk, QuickControl::Microphone, expanded).w(0.).grow(1.));
-    if let Some(lane) = snap.project.lanes.iter().find(|lane| lane.source == "microphone") {
-        let peak = snap.mixer_peaks.get("microphone").copied().unwrap_or(0.);
-        let level = mixer::meter_level(peak * lane.gain, lane.muted);
-        tile = tile.child(el().w(if compact { 10. } else { 19. }).h(4.).radius(2.)
-                .fill(color(theme::SLIDER_RAIL_COMPACT))
-                .child(el().w_frac(level).h_full().radius(2.).fill(color(MINT))))
-            .child(panels::send_tool("quick-mic-mute",
-                if lane.muted { "mic-off" } else { "mic" },
-                if lane.muted { "Unmute program mic" } else { "Mute program mic" }, lane.muted,
-                RoomCommand::Gain { source: "microphone".into(), gain: lane.gain, muted: !lane.muted },
-            ).size(if compact { 23. } else { 29. }, 30.));
-    }
-    tile
+    let settings_label = if expanded { "Hide program mic settings" } else { "Show program mic settings" };
+    let settings = el().key("quick-mic-settings").role("button").focusable(true)
+        .size(26., 32.).center().label(settings_label).help(settings_label)
+        .hover_fill(color(theme::GRIP_HOVER)).child(disclosure(expanded))
+        .on_press(|s: &mut Studio| toggle(s, &QuickControl::Microphone));
+    row().w_full().min_w(0.).h(32.).items_center().radius(6.).clip_rounded(6.).fill(color(surface))
+        .child(talk)
+        .child(el().w(1.).h(14.).fill(color(theme::GRIP).alpha(0.5)))
+        .child(settings)
 }
 
 fn disclosure(expanded: bool) -> El {
@@ -297,7 +293,7 @@ fn disclosure(expanded: bool) -> El {
 }
 
 fn with_settings(action: El, control: QuickControl, expanded: bool) -> El {
-    let name = if control == QuickControl::Microphone { "mic" } else { label(&control) };
+    let name = label(&control);
     let settings = panels::tool(
         &format!("quick-{}-settings", key(&control)),
         if expanded { "chevron-up" } else { "chevron-down" },
@@ -552,7 +548,7 @@ fn action(s: &Studio, live: &Live, control: &QuickControl, compact: bool) -> El 
     let expanded = s.quick_controls.expanded.as_ref() == Some(control);
     match control {
         QuickControl::Camera => return camera(snap, compact, expanded),
-        QuickControl::Microphone => return mic(s, snap, compact, expanded),
+        QuickControl::Microphone => return mic(s, compact, expanded),
         QuickControl::ScreenShare => {
             let sharing = panels::slot_ready(snap, "screen");
             let status = if sharing { "Sharing" } else { "Off" };
@@ -627,8 +623,8 @@ fn expanded_editor(s: &Studio, live: &Live, control: &QuickControl, columns: usi
         QuickControl::Camera => panels::source_settings(s, "camera", true),
         QuickControl::Microphone => {
             let settings = panels::source_settings(s, "microphone", true);
-            match mixer::shortcut_mic_gain(snap) {
-                Some(gain) => settings.child(gain),
+            match mixer::shortcut_mic_controls(snap) {
+                Some(controls) => settings.child(controls),
                 None => settings,
             }
         }
@@ -882,7 +878,7 @@ pub(super) fn rail(s: &Studio, live: &Live) -> El {
         }
         for control in controls {
             let width = match control {
-                QuickControl::Microphone => 158.,
+                QuickControl::Microphone => 118.,
                 QuickControl::Sound(_) => 128.,
                 QuickControl::ScreenShare | QuickControl::SaveClip => 115.,
                 _ => 96.,
@@ -1123,7 +1119,13 @@ mod rail_tests {
             for id in ["quick-camera","quick-mic-settings","quick-screen","quick-layouts","quick-clip-settings","quick-publish-settings"] {
                 click(&mut rt,id);
                 assert!(rt.find("shortcut-rail-editor").is_some(), "{id} on {edge:?}");
+                if id == "quick-mic-settings" {
+                    assert!(rt.find("quick-gain-microphone").is_some());
+                    click(&mut rt, "quick-mic-mute");
+                    assert!(matches!(commands.try_recv().unwrap().command, RoomCommand::Gain { source, .. } if source == "microphone"));
+                }
                 click(&mut rt,"shortcut-rail-close");
+                assert!(rt.find("quick-mic-mute").is_none());
             }
             click(&mut rt,"quick-clip-enable");
             assert!(matches!(commands.try_recv().unwrap().command, RoomCommand::ClipsEnable{enabled:true}));
