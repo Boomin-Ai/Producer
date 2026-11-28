@@ -931,10 +931,16 @@ fn shortcut_picker(workspace: &Workspace) -> El {
         let pinned = workspace.shortcuts().any(|pin| pin == &control);
         let name = label(&control);
         let caption = if pinned { format!("{name} · Added") } else { name.to_owned() };
-        choices = choices.child(button(format!("quick-pin-{}", key(&control)), caption, false, move |s| {
-            send_workspace(s, WorkspaceCommand::PinControl { control: control.clone() });
-            s.quick_controls.adding = false;
-        }).disabled(pinned));
+        let id = format!("quick-pin-{}", key(&control));
+        let item = if pinned {
+            button(id, caption, false, |_| {}).disabled(true).opacity(0.65)
+        } else {
+            button(id, caption, false, move |s| {
+                send_workspace(s, WorkspaceCommand::PinControl { control: control.clone() });
+                s.quick_controls.adding = false;
+            })
+        };
+        choices = choices.child(item);
     }
     choices.child(button("quick-add-sound", "+ Sound", false, open_sound_picker))
 }
@@ -1034,14 +1040,17 @@ mod rail_tests {
             rt.frame(0.04);
         };
         click(&mut rt, "quick-add-shortcut");
+        assert!(rt.state.quick_controls.adding);
         for control in QuickControl::BUILT_INS {
             click(&mut rt, &format!("quick-pin-{}", key(&control)));
+            assert!(rt.state.quick_controls.adding, "Pinned {control:?} closed the picker");
         }
         assert!(commands.try_recv().is_err(), "Already pinned shortcuts must be disabled");
         click(&mut rt, "quick-add-sound");
         assert!(rt.find("quick-sound-search").is_some());
         click(&mut rt, "quick-add-shortcut");
         click(&mut rt, "quick-edit-pins");
+        assert!(rt.state.quick_controls.editing);
         click(&mut rt, "quick-remove-mic");
         let apply = |rt: &mut rune::Runtime<Studio>| {
             let RoomCommand::Workspace { command } = commands.try_recv().unwrap().command else { panic!("expected workspace change") };
@@ -1050,6 +1059,7 @@ mod rail_tests {
         };
         apply(&mut rt);
         click(&mut rt, "quick-add-shortcut");
+        assert!(rt.state.quick_controls.adding, "Picker should open after removing Mic");
         click(&mut rt, "quick-pin-mic");
         apply(&mut rt);
         assert!(rt.state.quick_controls.editing && !rt.state.quick_controls.adding);
