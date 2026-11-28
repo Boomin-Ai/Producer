@@ -124,7 +124,8 @@
                 // model's token deltas through the UI queue adds work during audio playback.
                 NSDictionary *nested = event[@"event"];
                 NSString *kind = nested[@"type"];
-                if ([kind isEqual:@"response.created"] || [kind isEqual:@"response.failed"] ||
+                if ([kind isEqual:@"response.created"] || [kind isEqual:@"response.completed"] ||
+                    [kind isEqual:@"response.incomplete"] || [kind isEqual:@"response.failed"] ||
                     ([kind isEqual:@"response.output_item.done"] && [nested[@"item"][@"type"] isEqual:@"function_call"])) {
                     [self emit:event];
                 }
