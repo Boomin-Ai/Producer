@@ -5,7 +5,7 @@ use log::TurnLog;
 use super::*;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr::NonNull;
 
@@ -91,6 +91,7 @@ pub(super) struct Voice {
     pub status: String,
     draft: Option<publish::VoiceDraft>,
     seen: HashSet<String>,
+    delegations: HashMap<String, TurnLog>,
     log: Option<TurnLog>,
     rows: [Option<usize>; 2],
     input_end_ms: i64,
@@ -401,100 +402,123 @@ pub(super) fn poll(s: &mut Studio) -> bool {
     }
     while let Some(event) = s.chat.voice.connection.as_ref().and_then(Connection::next) {
         changed = true;
-        match event["type"].as_str() {
-            Some("listening") => s.chat.voice.status = "Duce is listening".into(),
-            Some("failure") => {
-                s.chat.voice.status = event["message"]
-                    .as_str()
-                    .unwrap_or("Voice session ended")
-                    .into();
-                ensure_log(s);
-                if let Some(log) = s.chat.voice.log.take() {
-                    log.record("voice_connection_ended", json!({"error":s.chat.voice.status}));
-                }
-                s.chat.voice.connection = None;
-            }
-            Some("session.input_transcript.delta" | "session.output_transcript.delta") => {
-                transcript(s, &event);
-            }
-            Some("response.event") if event["event"]["type"] == "response.created" => {
-                ensure_log(s);
-                if let Some(log) = &s.chat.voice.log {
-                    log.receipt.calls.fetch_add(1, Ordering::Relaxed);
-                    log.record("voice_delegation", json!({"delegationId":event["delegation_id"]}));
-                }
-            }
-            Some("response.event") if event["event"]["type"] == "response.failed" => {
-                s.chat.voice.status = event["event"]["response"]["error"]["message"]
-                    .as_str()
-                    .unwrap_or("Duce could not complete the action")
-                    .to_string();
-                ensure_log(s);
-                if let Some(log) = &s.chat.voice.log {
-                    log.record("voice_delegation_failed", json!({"error":s.chat.voice.status}));
-                }
-            }
-            Some("response.event") if event["event"]["type"] == "response.output_item.done" => {
-                let item = &event["event"]["item"];
-                if item["type"] != "function_call" {
-                    continue;
-                }
-                let Some(call) = item["call_id"].as_str() else {
-                    continue;
-                };
-                if !s.chat.voice.seen.insert(call.to_owned()) {
-                    continue;
-                }
-                ensure_log(s);
-                let log = s.chat.voice.log.clone();
-                let tool = item["name"].as_str().unwrap_or("unknown");
-                let started = Instant::now();
-                if let Some(log) = &log {
-                    log.receipt.step(tool);
-                    log.record("voice_tool_call", json!({"tool":tool,"callId":call,
-                        "delegationId":event["delegation_id"]}));
-                }
-                let result = if s.chat.voice.pending.is_some() && matches!(item["name"].as_str(), Some("draft_threads" | "review_threads" | "publish_draft" | "schedule_draft" | "operate_shortcut")) {
-                    Err(anyhow::anyhow!("Another Producer action is pending"))
-                } else {
-                    serde_json::from_str(item["arguments"].as_str().unwrap_or(""))
-                        .context("Invalid tool arguments")
-                        .and_then(|args| run(s, item["name"].as_str().unwrap_or(""), &args, call))
-                };
-                if let Some(log) = &log {
-                    if !matches!(result, Ok(None)) {
-                        log.result(tool, call, started, result.as_ref().err().map(ToString::to_string));
-                        if let Ok(Some(output)) = &result {
-                            log.record("voice_tool_output", json!({"tool":tool,"callId":call,"output":output}));
-                        }
-                    }
-                }
-                if let Some(reply) = result.unwrap_or_else(|e| Some(e.to_string())) {
-                    s.chat.voice.status = if matches!(item["name"].as_str(), Some("draft_threads" | "review_threads"))
-                        && s.chat
-                            .voice
-                            .draft
-                            .as_ref()
-                            .is_some_and(|d| reply.contains(&d.revision))
-                    {
-                        s.chat
-                            .voice
-                            .draft
-                            .as_ref()
-                            .map(publish::VoiceDraft::summary)
-                            .unwrap_or_default()
-                    } else {
-                        reply.clone()
-                    };
-                    if let Some(c) = &s.chat.voice.connection {
-                        c.reply(call, reply);
-                    }
-                }
-            }
-            _ => {}
-        }
+        handle_event(s, &event);
     }
     changed
+}
+
+fn handle_event(s: &mut Studio, event: &Value) {
+    match event["type"].as_str() {
+        Some("listening") => s.chat.voice.status = "Duce is listening".into(),
+        Some("failure") => {
+            s.chat.voice.status = event["message"]
+                .as_str()
+                .unwrap_or("Voice session ended")
+                .into();
+            ensure_log(s);
+            if let Some(log) = s.chat.voice.log.take() {
+                log.record("voice_connection_ended", json!({"error":s.chat.voice.status}));
+            }
+            s.chat.voice.delegations.clear();
+            s.chat.voice.connection = None;
+        }
+        Some("session.input_transcript.delta" | "session.output_transcript.delta") => {
+            transcript(s, event);
+        }
+        Some("response.event") if event["event"]["type"] == "response.created" => {
+            ensure_log(s);
+            if let Some(log) = &s.chat.voice.log {
+                if let Some(id) = event["delegation_id"].as_str() {
+                    s.chat.voice.delegations.insert(id.to_owned(), log.clone());
+                }
+                log.receipt.calls.fetch_add(1, Ordering::Relaxed);
+                log.record("voice_delegation", json!({"delegationId":event["delegation_id"]}));
+            }
+        }
+        Some("response.event") if event["event"]["type"] == "response.completed" => {
+            if let Some(id) = event["delegation_id"].as_str() {
+                s.chat.voice.delegations.remove(id);
+            }
+        }
+        Some("response.event") if matches!(event["event"]["type"].as_str(), Some("response.failed" | "response.incomplete")) => {
+            s.chat.voice.status = event["event"]["response"]["error"]["message"]
+                .as_str()
+                .unwrap_or("Duce could not complete the action")
+                .to_string();
+            ensure_log(s);
+            let log = event["delegation_id"].as_str().and_then(|id| s.chat.voice.delegations.remove(id))
+                .or_else(|| s.chat.voice.log.clone());
+            if let Some(log) = log {
+                log.record("voice_delegation_failed", json!({"error":s.chat.voice.status}));
+            }
+        }
+        Some("response.event") if event["event"]["type"] == "response.output_item.done" => {
+            let item = &event["event"]["item"];
+            if item["type"] != "function_call" {
+                return;
+            }
+            let Some(call) = item["call_id"].as_str() else {
+                return;
+            };
+            if !s.chat.voice.seen.insert(call.to_owned()) {
+                return;
+            }
+            ensure_log(s);
+            let log = event["delegation_id"].as_str().and_then(|id| s.chat.voice.delegations.get(id))
+                .or(s.chat.voice.log.as_ref()).cloned();
+            let tool = item["name"].as_str().unwrap_or("unknown");
+            let started = Instant::now();
+            if let Some(log) = &log {
+                log.receipt.step(tool);
+                log.record("voice_tool_call", json!({"tool":tool,"callId":call,
+                    "delegationId":event["delegation_id"]}));
+            }
+            let result = if s.chat.voice.pending.is_some() && matches!(item["name"].as_str(), Some("draft_threads" | "review_threads" | "publish_draft" | "schedule_draft" | "operate_shortcut")) {
+                Err(anyhow::anyhow!("Another Producer action is pending"))
+            } else {
+                serde_json::from_str(item["arguments"].as_str().unwrap_or(""))
+                    .context("Invalid tool arguments")
+                    .and_then(|args| run(s, item["name"].as_str().unwrap_or(""), &args, call))
+            };
+            if let Some(log) = &log {
+                if matches!(result, Ok(None)) {
+                    if let Some(pending) = &mut s.chat.voice.pending {
+                        pending.log = Some(log.clone());
+                    }
+                } else {
+                    log.result(tool, call, started, result.as_ref().err().map(ToString::to_string));
+                    if let Ok(Some(output)) = &result {
+                        log.record("voice_tool_output", json!({"tool":tool,"callId":call,"output":output}));
+                    }
+                }
+            }
+            let inspected = tool == "inspect_studio" && result.is_ok();
+            if let Some(reply) = result.unwrap_or_else(|e| Some(e.to_string())) {
+                s.chat.voice.status = if inspected {
+                    "Read studio state".into()
+                } else if matches!(item["name"].as_str(), Some("draft_threads" | "review_threads"))
+                    && s.chat
+                        .voice
+                        .draft
+                        .as_ref()
+                        .is_some_and(|d| reply.contains(&d.revision))
+                {
+                    s.chat
+                        .voice
+                        .draft
+                        .as_ref()
+                        .map(publish::VoiceDraft::summary)
+                        .unwrap_or_default()
+                } else {
+                    reply.clone()
+                };
+                if let Some(c) = &s.chat.voice.connection {
+                    c.reply(call, reply);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +534,24 @@ mod tests {
         }
         assert!(instructions.contains("schedule_draft"));
         assert!(instructions.contains("queued"));
+    }
+
+    #[test]
+    fn voice_interrupted_tool_is_recorded_on_its_original_turn() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut s = Studio::new(scratch.path().into());
+        let first = TurnLog::start(scratch.path(), 0).unwrap();
+        let second = TurnLog::start(scratch.path(), 2).unwrap();
+        s.chat.voice.log = Some(first.clone());
+        handle_event(&mut s, &json!({"type":"response.event","delegation_id":"old","event":{"type":"response.created"}}));
+        s.chat.voice.log = Some(second.clone());
+        handle_event(&mut s, &json!({"type":"response.event","delegation_id":"old","event":{
+            "type":"response.output_item.done","item":{"type":"function_call","call_id":"late-call",
+            "name":"inspect_studio","arguments":"{}"}}}));
+        handle_event(&mut s, &json!({"type":"response.event","delegation_id":"old","event":{"type":"response.completed"}}));
+        assert!(s.chat.voice.delegations.is_empty());
+        assert_eq!(first.receipt.receipt()[0]["label"], "inspect_studio");
+        assert!(second.receipt.receipt().is_empty());
     }
 
     #[test]
