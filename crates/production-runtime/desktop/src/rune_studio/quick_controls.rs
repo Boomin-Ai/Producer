@@ -58,7 +58,7 @@ impl HeadlineDraft {
     }
 }
 
-fn on_air_headline(snap: &Snapshot) -> Option<(String, SetLayoutPair, editor::HeadlineField)> {
+pub(super) fn on_air_headline(snap: &Snapshot) -> Option<(String, SetLayoutPair, editor::HeadlineField)> {
     if !matches!(snap.program_kind.as_str(), "set" | "show") {
         return None;
     }
@@ -887,6 +887,55 @@ fn edit_section(section: &ShortcutSection, index: usize, count: usize) -> El {
         ).size(24., 24.).padding(0.).label("Remove section").help("Move these shortcuts to Unsectioned"))
 }
 
+pub(super) fn rail(s: &Studio, live: &Live) -> El {
+    let workspace = &live.snapshot.project.workspace;
+    let mut strip = row().key("shortcut-rail").w_full().h(34.).items_center().gap(5.);
+    let groups = std::iter::once((None, workspace.quick_controls.as_slice()))
+        .chain(workspace.shortcut_sections.iter().map(|section| (Some(section), section.controls.as_slice())));
+    for (section, controls) in groups {
+        if let Some(section) = section {
+            strip = strip.child(section_header(section));
+        } else if !controls.is_empty() && !workspace.shortcut_sections.is_empty() {
+            strip = strip.child(title("Unsectioned", 11., 600., MUTED));
+        }
+        for control in controls {
+            let width = match control {
+                QuickControl::Microphone | QuickControl::Sound(_) => 128.,
+                QuickControl::ScreenShare | QuickControl::SaveClip => 115.,
+                _ => 96.,
+            };
+            strip = strip.child(action(s, live, control, true).w(width).min_w(width));
+        }
+    }
+    strip.scroll_x()
+}
+
+pub(super) fn rail_editor(s: &Studio, width: f32, height: f32) -> Option<El> {
+    let live = s.live.as_ref()?;
+    let workspace = &live.snapshot.project.workspace;
+    let panel = &workspace.panels[&PanelId::QuickControls];
+    let edge = panel.edge;
+    let dock = &workspace.docks[&edge];
+    let control = s.quick_controls.expanded.as_ref()?;
+    if edge.side() || !panel.visible || dock.hidden || !dock.collapsed
+        || !workspace.shortcuts().any(|p| p == control) || s.editing_docks {
+        return None;
+    }
+    let anchor = match control {
+        QuickControl::SaveClip | QuickControl::Publish => format!("quick-{}-settings", key(control)),
+        _ => format!("quick-{}", key(control)),
+    };
+    let width = (width - 16.).clamp(1., 370.);
+    let columns = if workspace.shortcut_columns == ShortcutColumns::Two && width >= 220. { 2 } else { 1 };
+    Some(col().key("shortcut-rail-editor").label(label(control)).role("dialog")
+        .anchored_fit(anchor, panels::dock_popover_side(edge), rune::Align::Start, 4.)
+        .w(width).max_h((height - 100.).max(36.)).padding(6.).radius(6.)
+        .border(1., color(theme::TAB_BORDER)).fill(color(PANEL))
+        .modal(true, |s: &mut Studio| s.quick_controls.collapse())
+        .child(expanded_editor(s, live, control, columns).scroll(Default::default()))
+        .child(button("shortcut-rail-close", "Close", false, |s| s.quick_controls.collapse()).self_start()))
+}
+
 pub(super) fn panel(s: &Studio, width: f32) -> El {
     let live = s.live.as_ref().unwrap();
     let workspace = &live.snapshot.project.workspace;
@@ -947,4 +996,69 @@ pub(super) fn panel(s: &Studio, width: f32) -> El {
             quick.move_shortcut = None;
         },
     ).self_start())
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_top_and_bottom_route_shortcuts_and_editors() {
+        for edge in [Edge::Top, Edge::Bottom] {
+            let scratch = tempfile::tempdir().unwrap();
+            let (handle, commands, _plan) = engine::initial_room(scratch.path()).unwrap();
+            let mut snapshot = handle.snapshot();
+            let workspace = &mut snapshot.project.workspace;
+            for panel in workspace.panels.values_mut() { panel.visible = false; }
+            let panel = workspace.panels.get_mut(&PanelId::QuickControls).unwrap();
+            panel.edge = edge;
+            panel.visible = true;
+            let dock = workspace.docks.get_mut(&edge).unwrap();
+            dock.hidden = false;
+            dock.collapsed = true;
+            workspace.quick_controls = vec![QuickControl::Camera];
+            let section = Uuid::new_v4();
+            let empty = Uuid::new_v4();
+            workspace.shortcut_sections = vec![
+                ShortcutSection { id: section, name: "On air".into(), controls: vec![
+                    QuickControl::Microphone, QuickControl::ScreenShare, QuickControl::Layouts,
+                    QuickControl::Headline, QuickControl::SaveClip, QuickControl::Publish,
+                    QuickControl::Sound("missing-pad".into()),
+                ] },
+                ShortcutSection { id: empty, name: "Later".into(), controls: vec![] },
+            ];
+            let mut s = Studio::new(scratch.path().into());
+            s.live = Some(Live { handle, snapshot, performance:StudioPerformance::new(0),
+                clip_view:Some(Default::default()), broadcast_view: Default::default(),
+                surfaces:std::array::from_fn(|_| NativeSurface::new()), guest_thumbnail: NativeSurface::new(),
+                worker: None, reviewing:Default::default(), previewing:Default::default(),
+                guest_view:Default::default(), updated:Instant::now() });
+            let mut rt = rune::Runtime::new(s, |s, _| panels::workspace(s, 1600., 800.),
+                (1600., 800.), rune::Env::default());
+            rt.frame(0.);
+            let click = |rt: &mut rune::Runtime<Studio>, id: &str| {
+                let (x, y) = rt.find(id).unwrap_or_else(|| panic!("missing {id} on {edge:?}"));
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                rt.frame(0.04);
+            };
+            for id in ["quick-camera","quick-mic","quick-screen","quick-layouts","quick-headline",
+                "quick-clip-enable","quick-publish","quick-sound-missing-pad"] {
+                assert!(rt.find(id).is_some(), "{id} on {edge:?}");
+            }
+            for id in [section,empty] {
+                assert!(rt.find(&format!("quick-section-{id}")).is_some());
+            }
+            for id in ["quick-camera","quick-mic","quick-screen","quick-layouts","quick-clip-settings","quick-publish-settings"] {
+                click(&mut rt,id);
+                assert!(rt.find("shortcut-rail-editor").is_some(), "{id} on {edge:?}");
+                click(&mut rt,"shortcut-rail-close");
+            }
+            click(&mut rt,"quick-clip-enable");
+            assert!(matches!(commands.try_recv().unwrap().command, RoomCommand::ClipsEnable{enabled:true}));
+            click(&mut rt,"quick-publish");
+            assert!(rt.find("quick-publish-sign-in").is_some());
+            assert!(rt.state.live.as_ref().unwrap().snapshot.project.workspace.docks[&edge].collapsed);
+        }
+    }
 }

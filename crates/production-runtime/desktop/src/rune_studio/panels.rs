@@ -530,6 +530,9 @@ pub(super) fn workspace(s: &Studio, w: f32, h: f32) -> El {
     if let Some((source, owner, anchor)) = &s.source {
         return completed.child(source_popout(s, source, ws.panels[owner].edge, anchor, w, h));
     }
+    if let Some(editor) = super::quick_controls::rail_editor(s, w, h) {
+        return completed.child(editor);
+    }
     if let Some(sheet) = super::channels::sheet(s, w) {
         completed.child(sheet)
     } else if let Some(panel) = super::chat::popout(s, &ws) {
@@ -1112,6 +1115,7 @@ fn strip(s: &Studio, id: PanelId, edge: Edge) -> El {
             );
         }
         PanelId::Assistant => return super::chat::compact(s),
+        PanelId::QuickControls => return super::quick_controls::rail(s, l),
         PanelId::Clips => {
             if let Some((st, _)) = &l.clip_view {
                 let name = format!("Save last {}s", st.settings.seconds);
@@ -1221,6 +1225,7 @@ fn dock(
             if let Some(header) = super::panel_frame::header(s, id, frame.header, split_publish) { panel = panel.child(header); }
         }
         if ws.docks[&edge].collapsed {
+            if id == PanelId::QuickControls { panel = panel.padding(3.); }
             panel = panel.child(strip(s, id, edge));
         } else if composing {
             panel = panel.child(super::publish::inline_composer(s, split_publish));
