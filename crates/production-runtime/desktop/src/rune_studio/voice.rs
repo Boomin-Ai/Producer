@@ -88,6 +88,7 @@ fn config() -> Value {
 #[derive(Default)]
 pub(super) struct Voice {
     connection: Option<Connection>,
+    pub(super) mic_ready: bool,
     pub status: String,
     draft: Option<publish::VoiceDraft>,
     seen: HashSet<String>,
@@ -114,31 +115,31 @@ impl Voice {
     }
 }
 
+pub(super) fn toggle(s: &mut Studio) {
+    if s.chat.voice.listening() {
+        s.chat.voice = Voice::default();
+        return;
+    }
+    let cfg = CString::new(config().to_string()).unwrap();
+    let connection = NonNull::new(unsafe { producer_voice_open(cfg.as_ptr()) }).map(Connection);
+    let status = if connection.is_some() { "Connecting to Duce…" } else { "Could not start Duce voice" };
+    if connection.is_none() {
+        s.error = status.into();
+    }
+    s.chat.voice = Voice { connection, status: status.into(), ..Default::default() };
+}
+
 pub(super) fn control(s: &Studio, compact: bool) -> El {
-    let on = s.chat.voice.connection.is_some();
+    let on = s.chat.voice.listening();
     super::panels::tool(
         if compact { "duce-quick" } else { "duce-voice" },
         if on { "stop" } else { "mic" },
-        if on {
-            "End Duce voice session"
-        } else {
-            "Talk to Duce"
-        },
+        if on { "End Duce voice session" } else { "Talk to Duce" },
         on,
         move |s| {
-            if s.chat.voice.connection.is_some() {
-                s.chat.voice = Voice::default();
-            } else {
-                let cfg = CString::new(config().to_string()).unwrap();
-                s.chat.voice = Voice {
-                    connection: NonNull::new(unsafe { producer_voice_open(cfg.as_ptr()) })
-                        .map(Connection),
-                    status: "Connecting to Duce…".into(),
-                    ..Default::default()
-                };
-                if compact {
-                    s.show_chat = true;
-                }
+            toggle(s);
+            if compact && s.chat.voice.listening() {
+                s.show_chat = true;
             }
         },
     )
@@ -409,7 +410,10 @@ pub(super) fn poll(s: &mut Studio) -> bool {
 
 fn handle_event(s: &mut Studio, event: &Value) {
     match event["type"].as_str() {
-        Some("listening") => s.chat.voice.status = "Duce is listening".into(),
+        Some("listening") => {
+            s.chat.voice.mic_ready = true;
+            s.chat.voice.status = "Duce is listening".into();
+        }
         Some("failure") => {
             s.chat.voice.status = event["message"]
                 .as_str()
@@ -419,7 +423,9 @@ fn handle_event(s: &mut Studio, event: &Value) {
             if let Some(log) = s.chat.voice.log.take() {
                 log.record("voice_connection_ended", json!({"error":s.chat.voice.status}));
             }
+            s.error = s.chat.voice.status.clone();
             s.chat.voice.delegations.clear();
+            s.chat.voice.mic_ready = false;
             s.chat.voice.connection = None;
         }
         Some("session.input_transcript.delta" | "session.output_transcript.delta") => {
