@@ -21,6 +21,8 @@ jobs:
       - name: Test voice delivery in a temporary studio
         working-directory: crates/production-runtime/desktop
         run: |
+          cargo test --locked restored_set_camera
+          cargo test --locked authored_take_confirms_both_native_outputs
           cargo test --locked voice_
           cargo test --locked rune_studio::quick_controls::rail_tests
           cargo test --locked quick_publish_shows_only_sign_in_and_resumes_after_authentication
@@ -32,12 +34,3 @@ jobs:
           name: duce-dev
           path: crates/production-runtime/desktop/target/debug/producer-native-room
           retention-days: 2
-      - name: Capture compact Duce tile
-        working-directory: crates/production-runtime/desktop
-        run: DUCE_TILE_PNG=/tmp/duce-tile.png cargo test --locked add_shortcut_is_available
-      - uses: actions/upload-artifact@v4
-        with:
-          name: duce-tile-preview
-          path: /tmp/duce-tile.png
-          retention-days: 2
-

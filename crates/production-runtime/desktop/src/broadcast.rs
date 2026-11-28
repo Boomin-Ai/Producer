@@ -730,7 +730,7 @@ mod program_acceptance {
             .unwrap()
             .iter()
             .all(|r| !r.enabled));
-        let h = crate::engine::start(root.clone()).unwrap();
+        let h = crate::engine::start(root.clone(), false).unwrap();
         fixture.host = Some(h.clone());
         let deadline = Instant::now() + std::time::Duration::from_secs(12);
         while h.snapshot().output_frames.contains(&0) {

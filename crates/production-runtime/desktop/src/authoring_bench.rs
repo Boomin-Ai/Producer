@@ -234,7 +234,7 @@ pub fn loaded(args: &[String]) -> Result<()> {
         "Supply an edit for this fixture"
     );
     let scratch = tempfile::tempdir()?;
-    let handle = engine::start(root.path().to_path_buf())?;
+    let handle = engine::start(root.path().to_path_buf(), false)?;
     let start = Instant::now();
     while handle.snapshot().output_frames.iter().any(|n| *n < 5) {
         ensure!(

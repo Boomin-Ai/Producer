@@ -1027,26 +1027,6 @@ mod rail_tests {
             surfaces:std::array::from_fn(|_| NativeSurface::new()), guest_thumbnail:NativeSurface::new(),
             worker:None, reviewing:Default::default(), previewing:Default::default(),
             guest_view:Default::default(), updated:Instant::now() });
-        if let Some(path) = std::env::var_os("DUCE_TILE_PNG") {
-            use rune::render::{Gpu, Offscreen, Renderer, OFFSCREEN_FORMAT};
-            let workspace = &mut s.live.as_mut().unwrap().snapshot.project.workspace;
-            let original = workspace.clone();
-            workspace.quick_controls = vec![QuickControl::Camera, QuickControl::Microphone, QuickControl::ScreenShare, QuickControl::Layouts];
-            workspace.shortcut_sections.clear();
-            workspace.shortcut_columns = ShortcutColumns::Two;
-            let mut preview = rune::Runtime::new(std::mem::replace(&mut s, Studio::new(scratch.path().into())), |s,_| col().w_full().h_full().padding(8.).fill(color(PANEL)).child(panel(s, 262.)), (278., 168.), rune::Env::default());
-            preview.frame(0.); preview.settle_all(); preview.frame(0.05);
-            let a = preview.find("quick-mic").unwrap(); let b = preview.find("quick-mic-settings").unwrap();
-            assert!(a.0 < b.0 && (a.1-b.1).abs() < 1.);
-            assert!(preview.find("quick-mic-mute").is_none());
-            let gpu = Gpu::headless();
-            let mut renderer = Renderer::new(&gpu.device, OFFSCREEN_FORMAT);
-            let target = Offscreen::new(&gpu.device, 278, 168);
-            renderer.render_runtime_to_offscreen(&gpu.device, &gpu.queue, &target, &mut preview);
-            rune::render::write_png(std::path::Path::new(&path), 278, 168, &target.read(&gpu.device)).unwrap();
-            std::mem::swap(&mut s, &mut preview.state);
-            s.live.as_mut().unwrap().snapshot.project.workspace = original;
-        }
         let mut rt = rune::Runtime::new(s, |s, _| panel(s, 400.), (400., 800.), rune::Env::default());
         rt.frame(0.);
         let click = |rt: &mut rune::Runtime<Studio>, key: &str| {
