@@ -32,3 +32,12 @@ jobs:
           name: duce-dev
           path: crates/production-runtime/desktop/target/debug/producer-native-room
           retention-days: 2
+      - name: Capture compact Duce tile
+        working-directory: crates/production-runtime/desktop
+        run: DUCE_TILE_PNG=/tmp/duce-tile.png cargo test --locked add_shortcut_is_available
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duce-tile-preview
+          path: /tmp/duce-tile.png
+          retention-days: 2
+
